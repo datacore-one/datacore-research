@@ -33,10 +33,37 @@ The module merges that file over the examples at startup.
 
 ### Podcast generation
 
-Audio overviews are generated through Google's Gemini Notebook (formerly
-NotebookLM), which has **no public consumer API** — the tooling drives
-undocumented endpoints and can break without notice. See
-`docs/pipeline-podcasts.md` for the current state.
+Audio overviews are generated through Google's Gemini Notebook (renamed from
+NotebookLM in July 2026) using [`notebooklm-py`](https://github.com/teng-lin/notebooklm-py):
+
+```bash
+uv tool install 'notebooklm-py[browser]'   # or: pipx install 'notebooklm-py[browser]'
+notebooklm login                            # browser sign-in, once
+notebooklm auth check --test --json         # expect "status": "ok"
+```
+
+Do **not** install it with a system `pip` — PEP 668 blocks that on modern macOS
+and Debian.
+
+Two things to know:
+
+1. **There is no public consumer API.** Gemini Notebook Enterprise has one, in
+   Preview, requiring a Gemini Enterprise licence and the
+   `roles/discoveryengine.podcastApiUser` IAM role; the standalone Podcast API
+   is deprecated and closed to new allowlisting. Everything else — including
+   this module — drives undocumented endpoints and can break without notice.
+2. **Only a machine with a browser can mint the credential.** Auth is browser
+   cookies, so a headless host can never refresh its own; it must be handed one.
+   `notebooklm auth refresh --quiet` is built for cron/launchd on the machine
+   that *can* refresh. This is the shape of the dependency, not a workaround.
+
+The legacy `nlm` Go CLI is still accepted as a fallback, but its audio and video
+creation RPCs have been rejecting every request since roughly September 2026
+while its notebook and source calls still work. On a host with only `nlm`, the
+notebook and its sources are created and no audio is produced — and the run says
+so rather than skipping silently.
+
+Video generation is intentionally not wired up.
 
 ## Installation
 
