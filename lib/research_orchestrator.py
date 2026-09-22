@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+"""
+Canonical home: research module (moved from nightshift 2026-07-14 — nightshift keeps a shim).
+
+Research Orchestrator — Python-driven research processing pipeline.
+
+Processes TODO items from research_learning.org:
+1. Python parses org file, picks top N items
+2. Python fetches each URL
+3. Claude analyzes content and creates literature notes + zettels
+4. Python updates org file (marks DONE)
+5. Python commits and pushes
+
+Usage:
+    python3 research_orchestrator.py [--limit N] [--dry-run] [--no-podcast]
+"""
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from claude_agent_sdk import query as _sdk_query, ClaudeAgentOptions
+from claude_agent_sdk.types import ResultMessage as _SdkResultMessage
+
+
+DATA_DIR = Path(os.environ.get('DATA_DIR', Path.home() / 'Data'))
+PERSONAL = DATA_DIR / '0-personal'
+ACME = DATA_DIR / '1-acme'
+
+
+def _module_settings() -> dict:
+    """Load settings defaults from this module's module.yaml.
+
+    Flattens {key: {default: X}} to {key: X}. Fail-safe: any error returns {}
+    so the hardcoded fallbacks below keep the pipeline alive.
+    """
+    try:
+        import yaml
+        my = DATA_DIR / '.datacore' / 'modules' / 'research' / 'module.yaml'
+        cfg = yaml.safe_load(my.read_text()) or {}
+        return {k: (v.get('default') if isinstance(v, dict) else v)
+                for k, v in (cfg.get('settings') or {}).items()}
+    except Exception:
+        return {}
+
+
+_SETTINGS = _module_settings()
+
+
+def _setting_path(key: str, fallback: Path) -> Path:
+    val = _SETTINGS.get(key)
+    return DATA_DIR / val if val else fallback
+
+
+RESEARCH_ORG = _setting_path('research_org_file', PERSONAL / 'org' / 'research_learning.org')
+DAILY_NEWS_ORG = PERSONAL / 'org' / 'daily_news.org'
+LITERATURE_DIR = _setting_path('literature_output_dir', PERSONAL / 'notes' / '2-knowledge' / 'literature')
+ZETTEL_DIR = _setting_path('zettel_output_dir', PERSONAL / 'notes' / '2-knowledge' / 'zettel')
+COMPANIES_DIR = PERSONAL / '3-knowledge' / 'reference' / 'companies'
+PEOPLE_DIR_DF = ACME / '3-knowledge' / 'reference' / 'people'
+PEOPLE_DIR_PERSONAL = PERSONAL / '3-knowledge' / 'reference' / 'people'
+LANDSCAPE_FILE = _setting_path('industry_landscape_file', PERSONAL / '3-knowledge' / 'reference' / 'Industry landscape.md')
+REPORTS_DIR = _setting_path('reports_output_dir', PERSONAL / 'content' / 'reports')
+JOURNAL_DIR = PERSONAL / 'notes' / 'journals'
+PODCAST_DIR = _setting_path('podcast_output_dir', PERSONAL / 'content' / 'podcasts')
+TODAY = date.today().isoformat()
+
+
+def log(msg: str):
+    print(f"[research] {msg}")
+
+
+# ---- Parse research queue ----
+
+def parse_research_items(limit: int = 10) -> List[Dict[str, str]]:
+    """Parse TODO items from research_learning.org."""
+    if not RESEARCH_ORG.exists():
+        log("research_learning.org not found")
+        return []
+
+    content = RESEARCH_ORG.read_text(encoding='utf-8')
+    lines = content.split('\n')
+    items = []
+
+    i = 0
+    # Match any heading level >= 2 (** TODO or *** TODO or **** TODO)
+    # Strip optional priority cookie [#A]/[#B]/[#C] and trailing :tag1:tag2:.
+    HEADING_RE = re.compile(r'^(\*{2,})\s+TODO\s+(?:\[#([ABC])\]\s+)?(.+?)(?:\s+:[\w:]+:)?\s*$')
+    # Extract URL from org-mode title-link: [[https://url][title]] or [[https://url]]
+    TITLE_LINK_RE = re.compile(r'\[\[(https?://[^\]]+?)(?:\]\[[^\]]*\])?\]')
+    # Collect ALL url-bearing TODOs, then sort and cut — limiting during
+    # collection made "priority A first" meaningless (file order won, so
+    # [#A] items appended late in the file waited weeks behind [#B] reads).
+    while i < len(lines):
+        line = lines[i]
+        match = HEADING_RE.match(line)
+        if match:
+            level = len(match.group(1))
+            priority = match.group(2) or 'C'
+            title = match.group(3).strip()
+            tags = ''
+            tag_match = re.search(r'(:\w[\w:]*:)\s*$', lines[i])
+            if tag_match:
+                tags = tag_match.group(1)
+
+            # First: try to extract URL directly from the title-link syntax
+            url = ''
+            title_link = TITLE_LINK_RE.search(title)
+            if title_link:
+                url = title_link.group(1)
+
+            purpose = ''
+            effort = ''
+            line_number = i + 1  # 1-indexed
+
+            # Look ahead for Link: line and properties (incl. :SOURCE: / :EXTERNAL_URL:)
+            j = i + 1
+            while j < len(lines) and j < i + 30:
+                l = lines[j].strip()
+                if l.startswith('Link:'):
+                    raw_url = l.split('Link:', 1)[1].strip()
+                    link_match = re.match(r'\[\[([^\]]+?)(?:\]\[[^\]]*\])?\]', raw_url)
+                    candidate = link_match.group(1) if link_match else raw_url
+                    if candidate.startswith('http') and not url:
+                        url = candidate
+                elif l.startswith(':SOURCE:') and not url:
+                    candidate = l.split(':SOURCE:', 1)[1].strip()
+                    if candidate.startswith('http'):
+                        url = candidate
+                elif l.startswith(':EXTERNAL_URL:') and not url:
+                    candidate = l.split(':EXTERNAL_URL:', 1)[1].strip()
+                    # Org may wrap as [[url][label]]
+                    em = re.match(r'\[\[([^\]]+?)(?:\]\[[^\]]*\])?\]', candidate)
+                    candidate = em.group(1) if em else candidate
+                    if candidate.startswith('http'):
+                        url = candidate
+                elif l.startswith('Purpose:'):
+                    purpose = l.split('Purpose:', 1)[1].strip()
+                elif ':EFFORT:' in l:
+                    effort = l.split(':EFFORT:', 1)[1].strip()
+                elif l.startswith('*'):
+                    break
+                j += 1
+
+            # URL-less TODOs (e.g. Daily News reading digests) are unprocessable
+            # here and must not consume limit slots — with limit=5 they
+            # head-of-line blocked the whole queue (Processed: 0 since ~May).
+            if url:
+                items.append({
+                    'title': title,
+                    'priority': priority,
+                    'url': url,
+                    'purpose': purpose,
+                    'effort': effort,
+                    'tags': tags,
+                    'line_number': line_number,
+                    'heading_line': line,
+                })
+
+        i += 1
+
+    # Sort by priority (A first), then cap at limit
+    items.sort(key=lambda x: x['priority'])
+    return items[:limit]
+
+
+# ---- Fetch URL content ----
+
+PAYWALL_DOMAINS = ('wsj.com', 'reuters.com', 'bloomberg.com', 'ft.com', 'nytimes.com',
+                   'theverge.com', 'archive.ph', 'archive.org', 'wired.com',
+                   'theinformation.com', 'economist.com')
+
+# Map domain → env var name holding cookie string (full Cookie: header value).
+# Populate the env vars from a browser session for paywalled sources you subscribe to.
+# Example: WSJ_COOKIES="wsjregion=NA,US; ...; sso_user_id=..."
+DOMAIN_COOKIE_ENV = {
+    'wsj.com': 'WSJ_COOKIES',
+    'nytimes.com': 'NYTIMES_COOKIES',
+    'ft.com': 'FT_COOKIES',
+    'bloomberg.com': 'BLOOMBERG_COOKIES',
+    'economist.com': 'ECONOMIST_COOKIES',
+    'theinformation.com': 'THEINFORMATION_COOKIES',
+}
+
+
+def _cookies_for(url: str) -> Optional[str]:
+    """Bind subscription credentials to their HTTPS domain, never URL text."""
+    try:
+        parsed = parse_public_url(url)
+    except ValueError:
+        return None
+    if parsed.scheme != 'https' or parsed.port not in (None, 443):
+        return None
+    host = parsed.hostname.lower().rstrip('.')
+    for domain, env_var in DOMAIN_COOKIE_ENV.items():
+        if host == domain or host.endswith('.' + domain):
+            return os.environ.get(env_var, '').strip() or None
+    return None
+
+
+def _fetch_jina(url: str) -> Optional[str]:
+    """Explicitly enabled public-URL proxy; credentials stay on its origin."""
+    if _SETTINGS.get('allow_url_proxies') is not True:
+        return None
+    jina_key = os.environ.get('JINA_API_KEY', '')
+    if not jina_key:
+        return None
+    try:
+        parsed = parse_public_url(url)
+        public_addresses(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+        content = download_public(f"https://r.jina.ai/{url}", max_bytes=2 * 1024 * 1024,
+            headers={'Authorization': f'Bearer {jina_key}', 'Accept': 'text/markdown'}).decode('utf-8', errors='replace')
+        return content[:15000] if len(content) > 200 else None
+    except (OSError, ValueError):
+        log("  Jina fetch failed")
+        return None
+
+
+def _fetch_direct(url: str, with_cookies: bool = False) -> Optional[str]:
+    """Bounded public HTTP fetch with origin-bound explicit credentials."""
+    try:
+        cookies = _cookies_for(url) if with_cookies else None
+        content = download_public(url, max_bytes=2 * 1024 * 1024,
+            headers={'Cookie': cookies} if cookies else None).decode('utf-8', errors='replace')
+        content = re.sub(r'<[^>]+>', ' ', content)
+        content = re.sub(r'\s+', ' ', content)
+        if len(content) > 500:
+            return content[:15000]
+        log("  Direct fetch returned too little content")
+    except (OSError, ValueError):
+        log("  Direct fetch failed")
+    return None
+
+
+def _fetch_wayback(url: str) -> Optional[str]:
+    """An archive lookup discloses the source URL and requires opt-in."""
+    if _SETTINGS.get('allow_url_proxies') is not True:
+        return None
+    try:
+        parsed = parse_public_url(url)
+        public_addresses(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+        avail_url = f"https://archive.org/wayback/available?url={urllib.parse.quote(url, safe='')}"
+        data = json.loads(download_public(avail_url, max_bytes=1024 * 1024))
+        snap = data.get('archived_snapshots', {}).get('closest', {})
+        if not snap.get('available') or not snap.get('url'):
+            return None
+        return _fetch_direct(snap['url']) or _fetch_jina(snap['url'])
+    except (OSError, ValueError):
+        log("  Archive fetch failed")
+        return None
+
+
+def fetch_url(url: str) -> Optional[str]:
+    """Fetch directly; source URLs reach extraction/archive proxies only by opt-in."""
+    if not url:
+        return None
+    content = _fetch_direct(url, with_cookies=_cookies_for(url) is not None)
+    if content:
+        return content
+    if _SETTINGS.get('allow_url_proxies') is True:
+        return _fetch_jina(url) or _fetch_wayback(url)
+    return None
+
+
+# ---- Process single item with Claude ----
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / 'lib'))
+from ops_markers import AUTH_FAILURE_MARKERS  # noqa: E402
+from text_model import claude_text_options
+from generated_notes import create_note as _create_note
+from public_download import download as download_public, parse_public_url, public_addresses
+from file_utils import locked_read_modify_write_text as _locked_text
+from org_literal import scalar as org_scalar, prose as org_prose
+from org_transaction import SafeOrgWorkspace as _SafeOrgWorkspace, serialized, watch_file, write_org_text as _write_org_text
+from contextvars import ContextVar
+from functools import wraps
+from publication_manifest import PublicationManifest
+
+_outputs = ContextVar('research_outputs', default=None)
+
+
+def _record_output(path, content):
+    manifest = _outputs.get()
+    if manifest is not None:
+        manifest.record(path, content)
+
+
+def create_note(*args, **kwargs):
+    path = _create_note(*args, **kwargs)
+    _record_output(path, kwargs['content'] if 'content' in kwargs else args[2])
+    return path
+
+
+def write_org_text(path, content):
+    _write_org_text(path, content)
+    _record_output(path, content)
+
+
+def locked_read_modify_write_text(path, modifier):
+    written = []
+    def apply(previous):
+        content = modifier(previous)
+        written.append(content)
+        return content
+    _locked_text(path, apply)
+    _record_output(path, written[0])
+
+
+class SafeOrgWorkspace(_SafeOrgWorkspace):
+    def _safe_write(self, path, content):
+        super()._safe_write(path, content)
+        _record_output(path, content)
+
+
+def track_publication(function):
+    @wraps(function)
+    def run(*args, **kwargs):
+        manifest = PublicationManifest(PERSONAL)
+        token = _outputs.set(manifest)
+        try:
+            result = function(*args, **kwargs)
+            if manifest.paths:
+                try:
+                    manifest.publish(f'nightshift: research processing {TODAY}')
+                    log(f'Published {len(manifest.paths)} recorded research output files')
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    log(f'Publication failed; outputs retained locally: {error}')
+                    return 1
+            return result
+        finally:
+            _outputs.reset(token)
+    return run
+
+
+def _claude_json(prompt: str, timeout: int, label: str) -> Optional[Dict[str, Any]]:
+    """Run a headless Claude analysis and parse its JSON reply.
+
+    RUNS IN AN EMPTY DIRECTORY, DELIBERATELY. These calls used to run with
+    cwd=DATA_DIR, which makes the SDK load ~/Data/CLAUDE.md — and that file
+    instructs the agent to call plur_session_start before anything else.
+    PLUR is not connected in a headless run, so instead of returning JSON the
+    model spent its turn explaining that the MCP server was missing. Every item
+    then failed to parse and was skipped. These prompts are self-contained
+    text-in/JSON-out; they need no workspace, so they get none.
+
+    Uses text-only claude_agent_sdk.query() with a $0.50 budget cap.
+    asyncio.run() bridges the async SDK into the synchronous pipeline.
+
+    Reports what actually came back on a parse failure. The bare
+    "Expecting value: line 1 column 1 (char 0)" that this replaces was true
+    and useless — it described the symptom and hid the response that would
+    have identified the cause in one read.
+    """
+    async def _run(workdir: str) -> Optional[str]:
+        options = ClaudeAgentOptions(
+            **claude_text_options(),
+            cwd=workdir,
+            max_budget_usd=0.50,
+        )
+        async for msg in _sdk_query(prompt=prompt, options=options):
+            if isinstance(msg, _SdkResultMessage):
+                if msg.is_error:
+                    errs = '; '.join(msg.errors or ['<no detail>'])
+                    log(f"  {label}: SDK returned error: {errs[:200]}")
+                    return None
+                return msg.result
+        return None
+
+    with tempfile.TemporaryDirectory() as workdir:
+        try:
+            output = asyncio.run(asyncio.wait_for(_run(workdir), timeout=timeout))
+        except asyncio.TimeoutError:
+            log(f"  {label}: Claude timed out after {timeout}s")
+            return None
+        except Exception as e:
+            log(f"  {label}: SDK error: {e}")
+            return None
+
+    if output is None:
+        return None
+    output = output.strip()
+
+    # ops_markers: auth failures can surface as plain text even when is_error=False.
+    # Its docstring requires every caller of the SDK in this repo to check the list.
+    low = output.lower()
+    for marker in AUTH_FAILURE_MARKERS:
+        if marker in low:
+            log(f"  {label}: AUTH FAILURE in SDK result text: {output[:200]!r}")
+            return None
+
+    output = re.sub(r'^```json\s*', '', output)
+    output = re.sub(r'\s*```\s*$', '', output)
+    if not output:
+        log(f"  {label}: Claude returned NOTHING (empty result)")
+        return None
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as error:
+        first_error = str(error)  # exception targets are cleared after an except block
+
+    # Repair invalid escape sequences, then try once more.
+    #
+    # JSON permits only \" \\ \/ \b \f \n \r \t \uXXXX. Models routinely emit
+    # \' when prose contains an apostrophe ("Ben\'s Bites"), which is valid in
+    # Python and JavaScript source but not in JSON, and json.loads rejects the
+    # whole document over one character. Dropping the stray backslash is safe:
+    # the negative lookahead leaves every legal escape untouched, so this
+    # cannot corrupt \n, \t or \uXXXX.
+    repaired = re.sub(r'\\(?!["\\/bfnrtu])', '', output)
+    if repaired != output:
+        try:
+            data = json.loads(repaired)
+            log(f"  {label}: repaired invalid escape sequence(s) in the reply")
+            return data
+        except json.JSONDecodeError:
+            pass
+
+    log(f"  {label}: reply was not JSON ({first_error})")
+    log(f"  {label}: got instead -> {output[:200]!r}")
+    return None
+
+
+def process_item(item: Dict[str, str], content: str) -> Optional[Dict[str, Any]]:
+    """Send fetched content to Claude for analysis. Returns structured output."""
+    title = item['title']
+    url = item['url']
+    purpose = item.get('purpose', '')
+
+    prompt = f"""Analyze this article and create knowledge artifacts.
+
+Title: {title}
+URL: {url}
+Purpose: {purpose}
+
+Content:
+{content[:12000]}
+
+Create FOUR outputs:
+
+1. A LITERATURE NOTE (markdown) with:
+   - Title, URL, date accessed
+   - 3-5 sentence summary
+   - Key takeaways (bullet points)
+   - Relevance to the purpose above
+   - Tags
+
+2. 1-3 ATOMIC ZETTELS — each a single concept extracted from the article.
+   Each zettel should have a descriptive title and 2-4 sentences explaining the concept.
+
+3. NAMED ENTITIES — companies and people mentioned in the article.
+   Only include entities that are CENTRAL to the article (not just passing mentions).
+   For companies, include the website if mentioned; for people, include role/affiliation.
+
+4. A short 1-2 sentence JOURNAL SUMMARY.
+
+Return as JSON:
+{{
+  "literature_note": {{
+    "filename": "slug-of-title.md",
+    "content": "full markdown content"
+  }},
+  "zettels": [
+    {{
+      "filename": "concept-name.md",
+      "content": "full markdown content"
+    }}
+  ],
+  "entities": {{
+    "companies": [
+      {{"name": "Company Name", "website": "https://...", "category": "ai|crypto|health|...", "one_liner": "what they do"}}
+    ],
+    "people": [
+      {{"name": "Person Name", "role": "CEO of X", "organization": "X", "context": "why mentioned"}}
+    ]
+  }},
+  "summary": "1-2 sentence summary for the journal"
+}}
+
+Output ONLY valid JSON, nothing else.
+"""
+
+    try:
+        return _claude_json(prompt, timeout=90, label="analysis")
+    except Exception as e:
+        log(f"  Processing error: {e}")
+        return None
+
+
+# ---- Write outputs ----
+
+def write_literature_note(data: Dict[str, str]) -> Optional[Path]:
+    """Write literature note to knowledge base."""
+    articles_dir = LITERATURE_DIR / 'articles'
+    articles_dir.mkdir(parents=True, exist_ok=True)
+
+    return create_note(articles_dir, data.get('filename', 'untitled.md'), data.get('content', ''))
+
+
+def _slug(s: str) -> str:
+    """Conservative slug for filenames."""
+    s = re.sub(r"['\"]", '', s)
+    s = re.sub(r'[^\w\s-]', '', s)
+    s = re.sub(r'\s+', '-', s).strip('-')
+    return s[:80]
+
+
+def write_companies(companies: List[Dict[str, str]], source_url: str) -> List[Path]:
+    """Write CRM stubs for new companies; append note for existing ones.
+
+    Skips entities already tracked in either:
+      - 0-personal/3-knowledge/reference/companies/
+      - 1-acme/3-knowledge/reference/companies/
+    """
+    if not companies:
+        return []
+
+    df_companies = ACME / '3-knowledge' / 'reference' / 'companies'
+    existing = set()
+    for d in (COMPANIES_DIR, df_companies):
+        if d.exists():
+            existing.update(p.stem.lower() for p in d.glob('*.md'))
+
+    created = []
+    for c in companies:
+        name = (c.get('name') or '').strip()
+        if not name:
+            continue
+        slug = _slug(name)
+        if not slug or slug.lower() in existing:
+            continue
+        # Model-derived categories cannot authorize publishing private source
+        # material into a shared space. New stubs remain personal for review.
+        cat = (c.get('category') or '').lower()
+        target_dir = COMPANIES_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{slug}.md"
+        content = f"""---
+type: contact
+entity_type: company
+name: {json.dumps(name)}
+status: draft
+relationship_status: discovered
+relevance: 2
+industries: {json.dumps([cat or 'unknown'])}
+website: {json.dumps(c.get('website', ''))}
+discovered_in: "Daily research {TODAY}"
+source: {json.dumps(source_url)}
+created: {TODAY}
+updated: {TODAY}
+---
+
+# {name}
+
+## Overview
+
+{c.get('one_liner', 'Discovered via daily research; needs review.')}
+
+## Notes
+
+Auto-captured from research pipeline {TODAY}. Source: {source_url}
+"""
+        path = create_note(target_dir, f"{slug}.md", content)
+        created.append(path)
+        existing.add(slug.lower())
+    return created
+
+
+def write_people(people: List[Dict[str, str]], source_url: str) -> List[Path]:
+    """Write CRM stubs for new people. Skips existing."""
+    if not people:
+        return []
+
+    existing = set()
+    for d in (PEOPLE_DIR_DF, PEOPLE_DIR_PERSONAL):
+        if d.exists():
+            existing.update(p.stem.lower() for p in d.glob('*.md'))
+
+    created = []
+    for p in people:
+        name = (p.get('name') or '').strip()
+        if not name:
+            continue
+        slug = _slug(name)
+        if not slug or slug.lower() in existing:
+            continue
+        target_dir = PEOPLE_DIR_PERSONAL
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{slug}.md"
+        content = f"""---
+type: contact
+entity_type: person
+name: {json.dumps(name)}
+status: draft
+relationship_status: discovered
+role: {json.dumps(p.get('role', ''))}
+organization: {json.dumps(p.get('organization', ''))}
+discovered_in: "Daily research {TODAY}"
+source: {json.dumps(source_url)}
+created: {TODAY}
+updated: {TODAY}
+---
+
+# {name}
+
+## Overview
+
+{p.get('context', 'Discovered via daily research; needs review.')}
+
+**Role**: {p.get('role', 'unknown')}
+**Organization**: {p.get('organization', 'unknown')}
+
+## Notes
+
+Auto-captured from research pipeline {TODAY}. Source: {source_url}
+"""
+        path = create_note(target_dir, f"{slug}.md", content)
+        created.append(path)
+        existing.add(slug.lower())
+    return created
+
+
+@serialized
+def append_landscape_rows(companies: List[Dict[str, str]]) -> List[str]:
+    """Append landscape rows for companies that aren't already in the table.
+
+    Looks for `[[Name]]` markers in the existing landscape file.
+    """
+    if not companies or not LANDSCAPE_FILE.exists():
+        return []
+
+    watch_file(LANDSCAPE_FILE)
+    text = LANDSCAPE_FILE.read_bytes().decode('utf-8')
+    appended_names = []
+    new_rows = []
+    for c in companies:
+        name = (c.get('name') or '').strip()
+        if not name:
+            continue
+        # Already in landscape?
+        marker = f"[[{name}]]"
+        if marker.lower() in text.lower() or f"|{name}|" in text:
+            continue
+        cat = c.get('category', 'unknown')
+        url = c.get('website', '')
+        url_md = f"[{url}]({url})" if url else ''
+        comment = c.get('one_liner', '').replace('|', ' / ').strip()
+        if comment and not comment.endswith('.'):
+            comment += '.'
+        comment += f" Captured {TODAY}."
+        row = f"|[[{name}]]|Watching|{url_md}|Tracking|{cat.capitalize()}|{comment}|||"
+        new_rows.append(row)
+        appended_names.append(name)
+
+    if not new_rows:
+        return []
+
+    header = f"\n## {TODAY} — Auto-captured peers from research pipeline\n\n"
+    text = text.rstrip() + '\n' + header + '\n'.join(new_rows) + '\n'
+    write_org_text(LANDSCAPE_FILE, text)
+    return appended_names
+
+
+def write_zettels(zettels: List[Dict[str, str]]) -> List[Path]:
+    """Write zettel notes."""
+    ZETTEL_DIR.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for z in zettels:
+        path = create_note(ZETTEL_DIR, z.get('filename', 'untitled.md'), z.get('content', ''))
+        paths.append(path)
+    return paths
+
+
+MAX_FETCH_ATTEMPTS = 3
+
+
+@serialized
+def note_fetch_failure(item: Dict[str, str]) -> Optional[int]:
+    """Count a failed fetch on the item; after MAX_FETCH_ATTEMPTS park it.
+
+    Three paywalled links sat at the head of the queue for weeks (2026-09-03:
+    Bloomberg, BizJournals, NYT -- no cookies, no Wayback snapshot). Every
+    run retried them, processed nothing, and the podcast step -- which needs
+    at least one processed item -- never ran. An item that cannot be fetched
+    is not a TODO for a machine; it is a request to a human for a readable
+    source. So: increment :FETCH_ATTEMPTS:, and at the limit set the heading
+    to WAITING with a :RESULT: that says exactly what is needed. The queue
+    drains; the summary names what is parked.
+    """
+    watch_file(RESEARCH_ORG)
+    try:
+        content = RESEARCH_ORG.read_text(encoding='utf-8')
+    except OSError:
+        return None
+    heading = item.get('heading_line')
+    if not heading or heading not in content:
+        return None
+    lines = content.split('\n')
+    hi = lines.index(heading)
+    # find an existing :FETCH_ATTEMPTS: within the item's body (before the next heading)
+    attempts = 0; ai = None
+    for j in range(hi + 1, len(lines)):
+        if lines[j].lstrip().startswith('*'):
+            break
+        if lines[j].strip().startswith(':FETCH_ATTEMPTS:'):
+            try:
+                attempts = int(lines[j].split(':FETCH_ATTEMPTS:', 1)[1].strip() or 0)
+            except ValueError:
+                attempts = 0
+            ai = j
+            break
+    attempts += 1
+    indent = '    '
+    if ai is not None:
+        lines[ai] = f"{indent}:FETCH_ATTEMPTS: {attempts}"
+    else:
+        # place right after the heading (and after a CLOSED/SCHEDULED planning line if present)
+        insert_at = hi + 1
+        if insert_at < len(lines) and lines[insert_at].strip().startswith(('CLOSED:', 'SCHEDULED:', 'DEADLINE:')):
+            insert_at += 1
+        lines.insert(insert_at, f"{indent}:FETCH_ATTEMPTS: {attempts}")
+    if attempts >= MAX_FETCH_ATTEMPTS and ' TODO ' in heading:
+        parked = heading.replace(' TODO ', ' WAITING ', 1)
+        lines[hi] = parked
+        lines.insert(hi + 1, f"{indent}:RESULT: unfetchable after {attempts} attempts (paywall/403, no archive) "
+                             f"-- provide the text, a PDF, or an archive link, then set TODO again")
+        log(f"  PARKED as WAITING after {attempts} failed fetches -- needs a readable source")
+    write_org_text(RESEARCH_ORG, '\n'.join(lines))
+    return attempts
+
+
+@serialized
+def mark_done(item: Dict[str, str], output_path: str, zettel_names: List[str]):
+    """Mark a research item as DONE in the org file."""
+    watch_file(RESEARCH_ORG)
+    content = RESEARCH_ORG.read_text(encoding='utf-8')
+    old_heading = item['heading_line']
+    new_heading = old_heading.replace(' TODO ', ' DONE ')
+
+    # Add CLOSED timestamp and properties
+    closed_line = f"    CLOSED: [{date.today().strftime('%Y-%m-%d %a')}]"
+    output_prop = f":OUTPUT: [[{output_path}]]" if output_path else ""
+    zettel_prop = f":ZETTELS: {', '.join(f'[[{z}]]' for z in zettel_names)}" if zettel_names else ""
+
+    # Replace heading
+    content = content.replace(old_heading, new_heading, 1)
+
+    # Insert CLOSED after the heading
+    lines = content.split('\n')
+    for i, line in enumerate(lines):
+        if line == new_heading:
+            # Insert closed timestamp after heading
+            insert_at = i + 1
+            # Skip past existing CLOSED line if any
+            if insert_at < len(lines) and 'CLOSED:' in lines[insert_at]:
+                lines[insert_at] = closed_line
+            else:
+                lines.insert(insert_at, closed_line)
+
+            # Find :END: in properties to add output/zettel props
+            for j in range(insert_at, min(insert_at + 15, len(lines))):
+                if ':END:' in lines[j]:
+                    insert_props = []
+                    if output_prop:
+                        insert_props.append(f"    {output_prop}")
+                    if zettel_prop:
+                        insert_props.append(f"    {zettel_prop}")
+                    for k, prop in enumerate(insert_props):
+                        lines.insert(j + k, prop)
+                    break
+            break
+
+    write_org_text(RESEARCH_ORG, '\n'.join(lines))
+
+
+# ---- Main Pipeline ----
+
+@serialized
+def auto_archive_stale_research(max_age_days: int = 60) -> int:
+    """Move research_learning.org items older than max_age_days to a dated
+    archive file. Prevents the queue from accumulating stale items that the
+    main pipeline never gets to.
+
+    Returns the count of items archived.
+    """
+    import re
+    import sys
+    from datetime import date
+    from pathlib import Path
+
+    if not RESEARCH_ORG.exists():
+        return 0
+
+    today_d = date.today()
+    archive_dir = RESEARCH_ORG.parent / '.archive'
+    archive_dir.mkdir(exist_ok=True)
+    archive_path = archive_dir / f'research_learning-auto-archived-{today_d.isoformat()}.org'
+
+    # Bulk archive may shrink the source heavily — temporarily raise guard.
+    ws = SafeOrgWorkspace()
+    ws._MAX_SHRINK_FRACTION = 0.85
+    ws.load(RESEARCH_ORG)
+
+    # Create archive file if first time today
+    if not archive_path.exists():
+        ws._safe_write(archive_path,
+            f"#+TITLE: Research auto-archive {today_d.isoformat()}\n"
+            f"#+CATEGORY: ResearchArchive\n"
+            f"#+FILETAGS: :archive:research:auto:\n"
+            f"#+STARTUP: overview\n\n"
+            f"* Auto-archived stale research items (>{max_age_days}d)\n"
+            f"  :PROPERTIES:\n"
+            f"  :ID: org-research-auto-archive-{today_d.isoformat()}\n"
+            f"  :END:\n"
+        )
+    ws.load(archive_path)
+
+    opens = [n for n in ws.all_nodes()
+             if 'research_learning.org' in str(n.path)
+             and '.archive' not in str(n.path)
+             and n.todo and n.todo not in ('DONE', 'CANCELLED', 'CLOSED', 'FAILED')]
+
+    stale_ids = []
+    for n in opens:
+        raw = n.get_property('CREATED') or n.get_property('RECEIVED') or ''
+        m = re.search(r'(\d{4}-\d{2}-\d{2})', raw)
+        if not m:
+            # Undated items >max_age_days assumed stale (no provenance)
+            # but only if the FILE itself is older than max_age_days — we
+            # don't want to archive items added yesterday that lack a date.
+            # Heuristic: undated items get a grace period of max_age_days
+            # before they're considered stale. Since we have no created
+            # date for them, we don't archive on this pass — they stay
+            # until they accrue a date or get manually triaged.
+            continue
+        d = date(*[int(x) for x in m.group().split('-')])
+        if (today_d - d).days > max_age_days:
+            stale_ids.append(n.id())
+
+    if not stale_ids:
+        return 0
+
+    log(f"Auto-archiving {len(stale_ids)} research items older than {max_age_days}d...")
+    archive_target = archive_path.resolve()
+    moved = 0
+    for tid in stale_ids:
+        node = ws.find_by_id(tid)
+        if not node:
+            continue
+        try:
+            ws.set_property(node, 'AUTO_ARCHIVED', today_d.isoformat())
+            node = ws.find_by_id(tid)
+            ws.refile(node, archive_target)
+            moved += 1
+        except Exception as e:
+            log(f"  archive failed for {tid}: {e}")
+    ws.save_all()
+    return moved
+
+
+
+# ---- Daily news section processor ----
+
+def extract_today_daily_news_section() -> Optional[str]:
+    """Extract today's section from daily_news.org as plain text + URLs.
+
+    Returns the section body or None if no section for today exists.
+    """
+    if not DAILY_NEWS_ORG.exists():
+        return None
+    text = DAILY_NEWS_ORG.read_text(encoding='utf-8')
+    lines = text.split('\n')
+    today_re = re.compile(rf'^\*\*\s+{re.escape(TODAY)}\b')
+    next_section_re = re.compile(r'^\*\*\s+\d{4}-\d{2}-\d{2}\b')
+    start = None
+    for i, line in enumerate(lines):
+        if today_re.match(line):
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if next_section_re.match(lines[j]):
+            end = j
+            break
+    return '\n'.join(lines[start:end])
+
+
+def process_daily_news() -> Optional[Path]:
+    """Build today's daily-news brief from daily_news.org and write to reports.
+
+    Calls Claude once with the section content; returns the brief path.
+    """
+    section = extract_today_daily_news_section()
+    if not section:
+        log("No daily_news.org section for today")
+        return None
+
+    prompt = f"""Build a daily-news brief for {TODAY} from this org-mode section.
+
+For each item below, produce a 2-3 sentence summary capturing what happened and
+why it matters. Group items into themes (AI Products, Markets & Funding, Policy,
+Crypto/Macro, Other). Keep brief — max 1500 words total.
+
+Also extract:
+- Up to 8 CENTRAL companies mentioned (with website + 1-liner + category)
+- Up to 6 CENTRAL people mentioned (with role + organization)
+- 3-5 action items the reader should consider
+
+Section content:
+{section[:14000]}
+
+Return as JSON:
+{{
+  "brief_markdown": "full markdown brief grouped by theme",
+  "entities": {{
+    "companies": [
+      {{"name": "...", "website": "...", "category": "...", "one_liner": "..."}}
+    ],
+    "people": [
+      {{"name": "...", "role": "...", "organization": "...", "context": "..."}}
+    ]
+  }},
+  "action_items": [
+    {{"title": "...", "context": "..."}}
+  ]
+}}
+
+Output ONLY valid JSON, nothing else.
+"""
+
+    try:
+        data = _claude_json(prompt, timeout=180, label="daily-news")
+        if data is None:
+            return None
+    except Exception as e:
+        log(f"  Daily-news Claude parse failed: {e}")
+        return None
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    brief_path = REPORTS_DIR / f"{TODAY}-daily-news-brief.md"
+    brief_md = data.get('brief_markdown') or ''
+    if not brief_md:
+        log("  Empty brief — skipping write")
+        return None
+
+    front = f"""---
+type: brief
+date: {TODAY}
+source: daily_news.org
+created: {TODAY}
+---
+
+# Daily News Brief {TODAY}
+
+"""
+    brief_path = create_note(REPORTS_DIR, brief_path.name, front + brief_md.rstrip() + '\n')
+    log(f"  Daily news brief: {brief_path}")
+
+    # Extract entities → CRM + landscape
+    entities = data.get('entities') or {}
+    companies = entities.get('companies') or []
+    people = entities.get('people') or []
+    company_paths = write_companies(companies, str(DAILY_NEWS_ORG))
+    person_paths = write_people(people, str(DAILY_NEWS_ORG))
+    landscape_added = append_landscape_rows(companies)
+    log(f"  Daily-news entities: {len(company_paths)} companies, {len(person_paths)} people, {len(landscape_added)} landscape")
+
+    # Append action items to inbox.org
+    inbox = PERSONAL / 'org' / 'inbox.org'
+    actions = data.get('action_items') or []
+    if actions and inbox.exists():
+        try:
+            count = append_news_actions(inbox, actions[:5], brief_path)
+            log(f"  Daily-news action items added: {count}")
+        except Exception as e:
+            log(f"  Inbox append failed: {e}")
+
+    return brief_path
+
+
+@serialized
+def append_news_actions(inbox, actions, brief_path):
+    watch_file(inbox)
+    text = inbox.read_bytes().decode('utf-8')
+    blocks = []
+    for action in actions:
+        title = (action.get('title') or '').strip()
+        context = action.get('context') or ''
+        if title:
+            literal_context = '\n'.join(org_prose(context))
+            blocks.append(f"** TODO {org_scalar(title)} :daily-news:research:\n:PROPERTIES:\n:CREATED: [{TODAY}]\n:SOURCE: Daily news brief {TODAY}\n:RESEARCH_URL: {org_scalar(str(brief_path.relative_to(DATA_DIR)))}\n:END:\n{literal_context}\n")
+    if blocks:
+        write_org_text(inbox, text + '\n\n' + '\n'.join(blocks))
+    return len(blocks)
+
+
+@track_publication
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Research Orchestrator')
+    parser.add_argument('--limit', '-l', type=int, default=5, help='Max items to process')
+    parser.add_argument('--dry-run', action='store_true', help='Parse queue but skip processing')
+    parser.add_argument('--no-podcast', action='store_true', help='Skip podcast generation')
+    parser.add_argument('--no-daily-news', action='store_true', help='Skip daily news brief')
+    parser.add_argument('--auto-archive-days', type=int, default=60,
+                        help='Auto-archive items older than this many days (0 to disable)')
+    args = parser.parse_args()
+
+    log(f"Starting research processing for {TODAY}")
+
+    # Step 0: Auto-archive stale items so the queue can't accumulate indefinitely.
+    # Without this, the queue grows whenever ingest > processing capacity and
+    # never drains — exactly how 365 items accumulated by 2026-05-20.
+    if args.auto_archive_days > 0 and not args.dry_run:
+        archived = auto_archive_stale_research(max_age_days=args.auto_archive_days)
+        if archived:
+            log(f"  Auto-archived {archived} stale items (>{args.auto_archive_days}d)")
+
+    # Step 1: Parse research queue
+    items = parse_research_items(limit=args.limit)
+    if not items:
+        log("No TODO items found in research queue. Nothing to do.")
+        return
+
+    # Filter to items with URLs (can't process without a link)
+    items_with_urls = [i for i in items if i.get('url')]
+    items_without = [i for i in items if not i.get('url')]
+
+    log(f"Found {len(items)} TODO items ({len(items_with_urls)} with URLs, {len(items_without)} without)")
+
+    if args.dry_run:
+        for i, item in enumerate(items, 1):
+            log(f"  {i}. [{item['priority']}] {item['title']}")
+            if item['url']:
+                log(f"     URL: {item['url'][:80]}")
+        return
+
+    # Step 2: Process each item
+    processed = []
+    failed = []
+
+    for i, item in enumerate(items_with_urls, 1):
+        log(f"\n[{i}/{len(items_with_urls)}] {item['title']}")
+
+        # Fetch content
+        log(f"  Fetching: {item['url'][:60]}...")
+        content = fetch_url(item['url'])
+        if not content:
+            log(f"  SKIP: Could not fetch URL")
+            failed.append(item)
+            note_fetch_failure(item)
+            continue
+
+        log(f"  Fetched {len(content)} chars")
+
+        # Process with Claude
+        log(f"  Analyzing with Claude...")
+        result = process_item(item, content)
+        if not result:
+            log(f"  SKIP: Claude analysis failed")
+            failed.append(item)
+            continue
+
+        # Write outputs
+        lit_path = None
+        if result.get('literature_note'):
+            lit_path = write_literature_note(result['literature_note'])
+            if lit_path:
+                log(f"  Literature note: {lit_path.name}")
+
+        zettel_paths = []
+        if result.get('zettels'):
+            zettel_paths = write_zettels(result['zettels'])
+            log(f"  Zettels: {len(zettel_paths)}")
+
+        # Extract entities → CRM stubs + landscape rows
+        entities = result.get('entities') or {}
+        companies = entities.get('companies') or []
+        people = entities.get('people') or []
+        company_paths = write_companies(companies, item['url'])
+        if company_paths:
+            log(f"  Companies created: {len(company_paths)}")
+        person_paths = write_people(people, item['url'])
+        if person_paths:
+            log(f"  People created: {len(person_paths)}")
+        landscape_added = append_landscape_rows(companies)
+        if landscape_added:
+            log(f"  Landscape rows added: {len(landscape_added)} ({', '.join(landscape_added[:3])})")
+
+        # Mark done in org file
+        zettel_names = [z.stem for z in zettel_paths]
+        output_rel = str(lit_path.relative_to(DATA_DIR)) if lit_path else ''
+        mark_done(item, output_rel, zettel_names)
+
+        processed.append({
+            'title': item['title'],
+            'summary': result.get('summary', ''),
+            'literature_note': str(lit_path) if lit_path else None,
+            'zettels': len(zettel_paths),
+            'companies': len(company_paths),
+            'people': len(person_paths),
+            'landscape_added': landscape_added,
+        })
+
+        log(f"  Done!")
+
+    # Step 3: Write journal entry
+    log(f"\nProcessed: {len(processed)}, Failed: {len(failed)}")
+
+    if processed:
+        journal_path = JOURNAL_DIR / f'{TODAY}.md'
+        section = f"\n\n## Research Processing\n\n"
+        section += f"Processed {len(processed)} research items:\n\n"
+        for p in processed:
+            section += f"- **{p['title']}**: {p['summary']} ({p['zettels']} zettels)\n"
+        if failed:
+            section += f"\nFailed to process: {len(failed)} items (kept as TODO for retry)\n"
+
+        locked_read_modify_write_text(journal_path, lambda existing:
+            (existing if existing is not None else f"---\ndate: {TODAY}\ntype: daily\n---\n") + section)
+
+        log(f"Journal updated: {journal_path}")
+
+    # Step 4: Daily news brief (best-effort)
+    daily_brief_path = None
+    if not args.no_daily_news:
+        try:
+            daily_brief_path = process_daily_news()
+        except Exception as e:
+            log(f"Daily-news step failed (non-fatal): {e}")
+
+    # Step 5: NotebookLM podcast (best-effort; pipeline must not fail if NLM is down)
+    notebook_id = None
+    if (processed or daily_brief_path) and not args.no_podcast:
+        try:
+            notebook_id = create_notebook_with_podcast(processed, daily_brief_path)
+            if notebook_id:
+                log(f"NotebookLM notebook ready: {notebook_id}")
+            else:
+                # "best-effort" governs whether the RUN fails, not whether the
+                # user is told. A podcast step that produced nothing and said
+                # nothing is indistinguishable from one that was never asked
+                # for — which is how this broke for six days unnoticed.
+                log("PODCAST STEP PRODUCED NO PODCAST — see the nlm errors above. "
+                    "If a notebook was created and only the audio failed, the line above "
+                    "says so and names which of the two faults it is: a rejected RPC is the "
+                    "client being out of date, an unusable session is the credential.")
+        except Exception as e:
+            log(f"NotebookLM step failed (non-fatal): {e}")
+
+    # Step 5: Telegram push (notebook URL + summary)
+    if processed:
+        try:
+            send_telegram_summary(processed, failed, notebook_id)
+        except Exception as e:
+            log(f"Telegram push failed (non-fatal): {e}")
+
+    # The outer publication scope commits only this run's recorded outputs
+    # after checking their hashes and the checkout's original clean state.
+
+    # Summary
+    log(f"\n{'='*50}")
+    log(f"Research Complete!")
+    log(f"{'='*50}")
+    log(f"Processed: {len(processed)}")
+    log(f"Failed: {len(failed)}")
+    log(f"Literature notes: {len([p for p in processed if p.get('literature_note')])}")
+    log(f"Total zettels: {sum(p.get('zettels', 0) for p in processed)}")
+    if notebook_id:
+        log(f"Notebook: https://notebooklm.google.com/notebook/{notebook_id}")
+
+
+# ---- NotebookLM podcast (best-effort) ----
+
+#: What the audio step's own error says about WHOSE fault it is. Reaching the RPC
+#: and being told the arguments are invalid is not an expired session -- the
+#: session had to work to get that answer. Measured 2026-09-18:
+#: "CreateAudioOverview: execute rpc: One or more arguments are invalid"
+#: (exit-class=bad-args) failed identically on winston and on the Mac with
+#: native, freshly refreshed auth, because the client's audio RPC is older than
+#: NotebookLM's API. Three weeks of alerts had been sending the owner to refresh
+#: a credential that was never the problem.
+def audio_failure_reason(detail: str) -> Optional[str]:
+    text = (detail or '').lower()
+    if 'bad-args' in text or 'arguments are invalid' in text:
+        # AND UPGRADING WILL NOT HELP EITHER, which is the second wrong answer
+        # this line used to give. Checked 2026-09-18: github.com/tmc/nlm has no
+        # releases and its last push was 2026-08-04, while the installed binary
+        # was built 2026-08-30 -- it already carries everything upstream has.
+        # NotebookLM moved its API underneath a client nobody has updated since.
+        #
+        # ISOLATED, not inferred. On an EMPTY notebook the same client answers
+        # "project has no sources - add sources before creating audio overview",
+        # so its audio path and this credential both work; on a fresh notebook
+        # holding one clean 146-byte text source, the server rejects the call
+        # exactly as it does for the research notebook. So it is neither our
+        # arguments (every documented flag was supplied) nor the sources.
+        return ("This is the nlm client's audio RPC, not the credential: the session reached "
+                "NotebookLM and NotebookLM rejected the call, so refreshing auth cannot change "
+                "this answer. Nor can upgrading: this binary is already at upstream HEAD "
+                "(github.com/tmc/nlm, no releases, last push 2026-08-04). The notebook and its "
+                "sources are created and usable; only the audio overview needs an upstream fix.")
+    if re.search(r'session is no longer usable|authentication (expired|refresh failed)|'
+                 r'browser auth failed|not logged in', text):
+        return ("The session is unusable: refresh it on the Mac (nlm_auth_sync.py sync), "
+                "which pushes a verified credential to this host.")
+    return None
+
+
+
+#: Where the audio step's availability is remembered between runs.
+AUDIO_STATE = Path.home() / ".datacore" / "state" / "nlm-audio-availability.json"
+
+#: The sentence cos_research.sh alerts on. Emitted ONLY when the state changes.
+AUDIO_BLOCKED_MARK = "PODCAST AUDIO BLOCKED UPSTREAM"
+AUDIO_RECOVERED_MARK = "PODCAST AUDIO WORKS AGAIN"
+
+
+def record_audio_availability(ok: bool, reason: Optional[str], *, today: Optional[str] = None,
+                              path: Optional[Path] = None) -> Optional[str]:
+    """Remember whether the audio step works, and speak only when that CHANGES.
+
+    A capability that is broken upstream, with the diagnosis already written
+    down and nothing the reader can do, does not become more actionable by
+    being said again tomorrow -- it becomes less. But going silent about it is
+    how a dead feature stays dead unnoticed, so silence has to end by itself:
+    the step still runs every night, and the FIRST run that succeeds says so.
+
+    Returns the line to log and alert on, or None while nothing has changed.
+    """
+    state_path = path or AUDIO_STATE
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    try:
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        was_blocked = bool(previous.get("blocked"))
+        since = previous.get("blocked_since") or day
+    except (OSError, ValueError):
+        previous, was_blocked, since = {}, False, day
+
+    record = {"blocked": not ok, "last_checked": day,
+              "blocked_since": (since if not ok else None),
+              "reason": (reason or "")[:400] if not ok else ""}
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except OSError:
+        pass        # the report matters more than remembering it
+
+    if not ok and not was_blocked:
+        return (f"{AUDIO_BLOCKED_MARK} since {since}. The notebook and its sources are still "
+                f"created and usable; only the audio overview fails. This will not be repeated "
+                f"daily -- the next run that succeeds reports it.")
+    if ok and was_blocked:
+        return f"{AUDIO_RECOVERED_MARK} (blocked since {since}) — nothing to do, it is producing audio."
+    return None
+
+
+def create_notebook_with_podcast(processed: List[Dict[str, Any]],
+                                  daily_brief_path: Optional[Path] = None) -> Optional[str]:
+    """Create a NotebookLM notebook, add literature notes + daily-news brief as sources,
+    queue audio overview.
+
+    Returns notebook UUID on success, None on failure. The audio overview generation
+    is queued asynchronously — user must manually download via browser (CLI is
+    blocked by Google CDN cookie requirement).
+    """
+    nlm = os.environ.get('NLM_BIN') or _SETTINGS.get('nlm_path') or ''
+    if not nlm or not Path(nlm).exists():
+        # Fallback to PATH lookup
+        nlm_path = subprocess.run(['which', 'nlm'], capture_output=True, text=True).stdout.strip()
+        if not nlm_path:
+            log("  nlm binary not found — skipping podcast")
+            return None
+        nlm = nlm_path
+
+    # Create notebook
+    title = f"Datacore Research {TODAY}"
+    log(f"  Creating notebook: {title}")
+    # TRY BOTH SPELLINGS, newest first. This was pinned to old-style
+    # ('create') because the Apr 2026 server binary only knew that form and
+    # the new binary kept it as an alias. The binary has since been upgraded
+    # and now REJECTS it — "nlm: 'create' is deprecated; use 'notebook
+    # create'" — so the pin inverted the bug rather than removing it and the
+    # podcast step produced no notebook on every run.
+    #
+    # Flipping the pin the other way would just queue up the same failure for
+    # whichever host upgrades last. Trying both tolerates either binary, and
+    # the fallback disappears on its own once no old binary remains.
+    res = None
+    errors = []
+    for argv in ([nlm, 'notebook', 'create', title], [nlm, 'create', title]):
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            break
+        errors.append((' '.join(argv[1:-1]), res.stderr))
+    if res.returncode != 0:
+        # REPORT EVERY ATTEMPT, the preferred spelling first. Logging only the
+        # last one printed the FALLBACK's "'create' is deprecated" three nights
+        # running, while the real failure -- the preferred `notebook create` --
+        # was "cached browser session is no longer usable" (2026-09-17). That
+        # message sent the diagnosis to the command syntax instead of the auth.
+        for spelling, err in errors:
+            log(f"  nlm {spelling} failed: {' '.join(err.split())[:220]}")
+        if any(re.search(r'session is no longer usable|authentication (expired|refresh failed)|'
+                         r'browser auth failed', err) for _, err in errors):
+            log("  nlm auth on this host has expired. The credential is copied browser cookies, "
+                "which Google rotates; refresh it on the Mac (nlm_auth_sync.py sync).")
+        return None
+
+    # Extract notebook ID from output
+    nb_match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', res.stdout)
+    if not nb_match:
+        log(f"  Could not extract notebook ID from: {res.stdout[:200]}")
+        return None
+    notebook_id = nb_match.group(1)
+    log(f"  Notebook ID: {notebook_id}")
+
+    # Build the source list: literature notes + daily-news brief
+    sources: List[str] = []
+    for p in processed:
+        lit = p.get('literature_note')
+        if lit:
+            sources.append(lit)
+    if daily_brief_path:
+        sources.append(str(daily_brief_path))
+
+    # Add sources
+    sources_added = 0
+    for src in sources:
+        try:
+            # Same two-spelling tolerance as notebook creation: the devel
+            # build spells it `source add`, older builds `add`.
+            add_res = None
+            for argv in ([nlm, 'source', 'add', notebook_id, src], [nlm, 'add', notebook_id, src]):
+                add_res = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                if add_res.returncode == 0:
+                    break
+            if add_res.returncode == 0:
+                sources_added += 1
+            else:
+                log(f"  add failed for {src}: {add_res.stderr[:120]}")
+        except Exception as e:
+            log(f"  add error for {src}: {e}")
+    log(f"  Sources added: {sources_added}")
+
+    if sources_added == 0:
+        log("  No sources added — skipping audio generation")
+        return notebook_id
+
+    # Queue audio overview.
+    #
+    # INSTRUCTIONS MUST BE EMPTY. In notebooklm/client_audio.go,
+    # CreateAudioOverviewWithOptions routes to the new CreateUniversalArtifact
+    # RPC only when Instructions == "" (and DEEP_DIVE / DEFAULT / "en"). ANY
+    # custom instruction falls through to the old CreateAudioOverview path,
+    # which the server now rejects with "One or more arguments are invalid".
+    #
+    # This function used to pass a per-day instruction string, so every audio
+    # overview failed — and because the failure was only logged, the run
+    # reported success with no podcast. That is the silent-failure mode this
+    # whole path keeps regressing into. Custom instructions must be set in the
+    # web UI instead. See ENG-2026-08-09-028.
+    # Same two-spelling tolerance as notebook creation above: `audio create`
+    # is the current form, `create-audio` the legacy alias that is next in
+    # line to be dropped.
+    audio_res = None
+    # Never send empty instructions: the client rejects '' as "invalid
+    # arguments" before any RPC is made (verified on winston 2026-09-03), so an
+    # empty string can only ever fail. A real brief also makes a better podcast.
+    instructions = ("A concise two-host briefing on today's research for a founder: "
+                    "what each source found, why it matters, and the one decision it implies.")
+    for argv in ([nlm, 'audio', 'create', '--audio-type', 'deep-dive', notebook_id, instructions],
+                 [nlm, 'create-audio', notebook_id, instructions]):
+        audio_res = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if audio_res.returncode == 0:
+            break
+    if audio_res.returncode != 0:
+        # Loud, and reflected in the return value: a notebook with no audio is
+        # not a podcast, and a caller that cannot distinguish the two will keep
+        # reporting success to the user while nothing is produced.
+        detail = (audio_res.stderr or audio_res.stdout)
+        log(f"  AUDIO QUEUE FAILED: {' '.join(detail.split())[:300]}")
+        log(f"  Notebook {notebook_id} exists with {sources_added} source(s) but has NO audio.")
+        # NAME THE FAULT THE OPERATOR ACTUALLY HAS. Reaching the RPC and being
+        # told the arguments are invalid is not an expired session -- the
+        # session had to work to get that answer. Measured 2026-09-18:
+        # "CreateAudioOverview: execute rpc: One or more arguments are invalid"
+        # (exit-class=bad-args) failed identically on winston AND on the Mac
+        # with native, freshly refreshed auth, because the client's audio RPC
+        # is older than NotebookLM's API. Three weeks of alerts had been
+        # sending the owner to refresh a credential that was never the problem.
+        reason = audio_failure_reason(detail)
+        if reason:
+            log("  " + reason)
+        transition = record_audio_availability(False, reason)
+        if transition:
+            log(transition)
+        return None
+
+    transition = record_audio_availability(True, None)
+    if transition:
+        log(transition)
+    log("  Audio overview queued")
+    return notebook_id
+
+
+def send_telegram_summary(processed: List[Dict[str, Any]], failed: List[Dict[str, str]],
+                          notebook_id: Optional[str]) -> bool:
+    """Push a research-run summary to Telegram. Returns True on success."""
+    # Broker-served. An earlier version of this fell back to reading
+    # ~/.datacore/datacore.env directly, and on winston that file holds a
+    # DIFFERENT bot's token — @kton9_bot, which belongs to hermes, not
+    # @datacore_1_bot. The research digest was being addressed to the wrong bot
+    # with nothing reporting an error, which is exactly the failure mode a
+    # file-search credential lookup produces: it finds *a* value and cannot tell
+    # you it is the wrong one.
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token:
+        broker = Path.home() / "Data" / ".datacore" / "lib" / "creds.py"
+        if broker.is_file():
+            try:
+                r = subprocess.run(
+                    ["python3", str(broker), "get", "mrdata-telegram-bot",
+                     "--consumer", "research.digest"],
+                    capture_output=True, text=True, timeout=90)
+                if r.returncode == 0 and r.stdout.strip():
+                    token = r.stdout.strip()
+                else:
+                    log(f"  [creds] broker declined the telegram bot token: "
+                        f"{(r.stderr or '').strip()[:120]}")
+            except Exception as e:  # noqa: BLE001
+                log(f"  [creds] broker unavailable ({type(e).__name__})")
+    if not chat_id:
+        # The chat id is an identifier, not a secret, and is not brokered.
+        env_file = Path.home() / ".datacore" / "datacore.env"
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:]
+                if line.startswith("TELEGRAM_CHAT_ID="):
+                    chat_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+
+    if not token or not chat_id:
+        missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", token),
+                                  ("TELEGRAM_CHAT_ID", chat_id)) if not v]
+        log(f"  Telegram push SKIPPED — missing {', '.join(missing)} "
+            f"(checked environment and ~/.datacore/datacore.env)")
+        return False
+
+    lines = [f"📚 Research processed for {TODAY}"]
+    lines.append(f"✅ {len(processed)} items · ❌ {len(failed)} failed")
+    if notebook_id:
+        lines.append("")
+        lines.append("🎧 Audio overview generating in NotebookLM:")
+        lines.append(f"https://notebooklm.google.com/notebook/{notebook_id}")
+        lines.append("(Tap Audio Overview → ⋯ → Download — CDN cookie blocks CLI download)")
+    if processed:
+        lines.append("")
+        lines.append("Top items:")
+        for p in processed[:5]:
+            lines.append(f"• {p['title'][:80]}")
+
+    msg = "\n".join(lines)
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=urllib.parse.urlencode({
+                'chat_id': chat_id,
+                'text': msg,
+                'disable_web_page_preview': 'false',
+            }).encode('utf-8'),
+            method='POST'
+        )
+        from secret_http import urlopen
+        with urlopen(req, timeout=15) as resp:
+            ok = resp.status == 200
+        log(f"  Telegram push: {'ok' if ok else 'failed'}")
+        return ok
+    except Exception as e:
+        log(f"  Telegram error: {e}")
+        return False
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
